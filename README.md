@@ -15,10 +15,11 @@ import "github.com/etclab/pathoram-go"
 
 // Create ORAM instance
 oram, err := pathoram.NewPathORAM(pathoram.Config{
-    NumBlocks:  1000,  // max blocks
-    BlockSize:  512,   // bytes per block
-    BucketSize: 5,     // blocks per bucket (default: 5)
-    StashLimit: 100,   // max stash size (default: 100)
+    NumBlocks:        1000,                          // max blocks
+    BlockSize:        512,                           // bytes per block
+    BucketSize:       5,                             // blocks per bucket (default: 5)
+    StashLimit:       100,                           // max stash size (default: 100)
+    EvictionStrategy: pathoram.EvictGreedyByDepth,   // optional (default: EvictLevelByLevel)
 })
 
 // Write
@@ -43,6 +44,14 @@ data, err = oram.Access(pathoram.OpRead, 42, nil)
 | `Access(op, blockID, data)` | Unified read/write |
 | `Size()` | Number of allocated blocks |
 | `Capacity()` | Max blocks (from config) |
+
+## Eviction Strategies
+
+| Strategy | Description |
+|----------|-------------|
+| `EvictLevelByLevel` | Baseline strategy. Iterates levels leaf-to-root, fills slots greedily. |
+| `EvictGreedyByDepth` | Places each block at deepest possible level first. Reduces stash pressure. |
+| `EvictDeterministicTwoPath` | Evicts along two paths per access. Reduces stash size variance. |
 
 ## Build
 

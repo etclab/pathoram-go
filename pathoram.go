@@ -6,6 +6,11 @@ import (
 	"math/big"
 )
 
+const (
+	// EmptyBlockID marks a block slot as empty/dummy.
+	EmptyBlockID = -1
+)
+
 var (
 	ErrInvalidConfig   = errors.New("invalid PathORAM configuration")
 	ErrInvalidBlockID  = errors.New("invalid block ID")
@@ -21,17 +26,36 @@ const (
 	OpWrite
 )
 
+// EvictionStrategy defines how blocks are evicted from stash to tree.
+type EvictionStrategy int
+
+const (
+	// EvictLevelByLevel iterates levels from leaf to root, filling slots greedily.
+	// This is the original/baseline strategy.
+	EvictLevelByLevel EvictionStrategy = iota
+
+	// EvictGreedyByDepth places each block at its deepest possible level first.
+	// Reduces stash pressure by maximizing depth utilization.
+	EvictGreedyByDepth
+
+	// EvictDeterministicTwoPath evicts along two paths per access.
+	// Reduces stash size variance (Path ORAM optimization).
+	EvictDeterministicTwoPath
+)
+
 // Config holds PathORAM configuration parameters.
 type Config struct {
-	NumBlocks  int // Total number of blocks to support
-	BlockSize  int // Size of each block in bytes
-	BucketSize int // Number of blocks per bucket (Z parameter)
-	StashLimit int // Maximum stash size before error
+	NumBlocks        int              // Total number of blocks to support (valid IDs: 0 to NumBlocks-1)
+	BlockSize        int              // Size of each block in bytes
+	BucketSize       int              // Number of blocks per bucket (Z parameter)
+	StashLimit       int              // Maximum stash size before error
+	EvictionStrategy EvictionStrategy // Eviction strategy to use
 }
 
 // block represents a single data block.
+// Block ID -1 means empty/dummy.
 type block struct {
-	id   int    // Block ID (-1 means dummy/empty)
+	id   int    // Block ID (-1 = empty/dummy)
 	leaf int    // Assigned leaf position
 	data []byte // Block data
 }
@@ -65,15 +89,15 @@ func NewPathORAM(cfg Config) (*PathORAM, error) {
 	for (1<<height)-1 < numBuckets { // 2^h - 1 = total nodes in complete binary tree
 		height++
 	}
-	numLeaves := 1 << (height - 1)            // 2^(h-1) leaves
-	totalBuckets := (1 << height) - 1         // 2^h - 1 total nodes
+	numLeaves := 1 << (height - 1)    // 2^(h-1) leaves
+	totalBuckets := (1 << height) - 1 // 2^h - 1 total nodes
 
 	// Initialize tree with empty buckets
 	tree := make([][]block, totalBuckets)
 	for i := range tree {
 		tree[i] = make([]block, cfg.BucketSize)
 		for j := range tree[i] {
-			tree[i][j] = block{id: -1, leaf: -1, data: make([]byte, cfg.BlockSize)}
+			tree[i][j] = block{id: EmptyBlockID, leaf: -1, data: make([]byte, cfg.BlockSize)}
 		}
 	}
 
@@ -113,6 +137,7 @@ func (o *PathORAM) Size() int {
 }
 
 // Access performs an oblivious read or write operation.
+// Valid block IDs are 0 to NumBlocks-1.
 // For OpRead: returns current data (zeros if block doesn't exist), data param ignored.
 // For OpWrite: stores data, returns previous value.
 func (o *PathORAM) Access(op OpType, blockID int, data []byte) ([]byte, error) {
@@ -191,9 +216,9 @@ func (o *PathORAM) access(blockID int, newData []byte) ([]byte, error) {
 	for _, bucketIdx := range path {
 		for i := range o.tree[bucketIdx] {
 			b := &o.tree[bucketIdx][i]
-			if b.id != -1 {
+			if b.id != EmptyBlockID {
 				o.stash = append(o.stash, *b)
-				b.id = -1 // mark as empty
+				b.id = EmptyBlockID // mark as empty
 			}
 		}
 	}
@@ -213,10 +238,8 @@ func (o *PathORAM) access(blockID int, newData []byte) ([]byte, error) {
 	// Step 5: Handle read/write
 	if foundIdx == -1 {
 		// Block not found - new block or first read
+		// Previous value is zeros (per Path ORAM spec)
 		result = make([]byte, o.cfg.BlockSize)
-		if newData != nil {
-			copy(result, newData)
-		}
 		// Add block to stash
 		newBlock := block{
 			id:   blockID,
@@ -232,16 +255,41 @@ func (o *PathORAM) access(blockID int, newData []byte) ([]byte, error) {
 		o.stash[foundIdx].leaf = o.posMap[blockID]
 		if newData != nil {
 			copy(o.stash[foundIdx].data, newData)
-			copy(result, newData)
 		}
 	}
 
 	// Step 6: Eviction - write blocks back to path
-	if err := o.evict(path); err != nil {
+	if err := o.evictWithStrategy(path); err != nil {
 		return nil, err
 	}
 
 	return result, nil
+}
+
+// evictWithStrategy dispatches to the configured eviction strategy.
+func (o *PathORAM) evictWithStrategy(path []int) error {
+	switch o.cfg.EvictionStrategy {
+	case EvictGreedyByDepth:
+		return o.evictGreedyByDepth(path)
+	case EvictDeterministicTwoPath:
+		if err := o.evictGreedyByDepth(path); err != nil {
+			return err
+		}
+		// Read second path into stash, then evict along it
+		secondPath := o.Path(o.randomLeaf())
+		for _, bucketIdx := range secondPath {
+			for i := range o.tree[bucketIdx] {
+				b := &o.tree[bucketIdx][i]
+				if b.id != EmptyBlockID {
+					o.stash = append(o.stash, *b)
+					b.id = EmptyBlockID
+				}
+			}
+		}
+		return o.evictGreedyByDepth(secondPath)
+	default: // EvictLevelByLevel
+		return o.evict(path)
+	}
 }
 
 // evict writes blocks from stash back to the path.
@@ -253,7 +301,7 @@ func (o *PathORAM) evict(path []int) error {
 
 		// Find blocks in stash that can go to this bucket
 		for slot := 0; slot < o.cfg.BucketSize; slot++ {
-			if bucket[slot].id != -1 {
+			if bucket[slot].id != EmptyBlockID {
 				continue // slot occupied
 			}
 			// Find a block whose path contains this bucket
@@ -278,12 +326,60 @@ func (o *PathORAM) evict(path []int) error {
 
 // canPlaceAt returns true if a block assigned to the given leaf
 // can be placed in the bucket at bucketIdx.
+// Uses ancestry check: bucket B is on leaf L's path iff L's leaf bucket
+// is in the subtree rooted at B.
 func (o *PathORAM) canPlaceAt(leaf, bucketIdx int) bool {
-	path := o.Path(leaf)
-	for _, idx := range path {
-		if idx == bucketIdx {
+	// Leaf's bucket index
+	leafBucket := o.numLeaves - 1 + leaf
+
+	// Walk from leafBucket to root, checking if we hit bucketIdx
+	for b := leafBucket; b >= 0; b = (b - 1) / 2 {
+		if b == bucketIdx {
 			return true
+		}
+		if b == 0 {
+			break
 		}
 	}
 	return false
+}
+
+// evictGreedyByDepth places each stash block at its deepest possible level.
+// This minimizes stash pressure by keeping blocks as close to leaves as possible.
+func (o *PathORAM) evictGreedyByDepth(path []int) error {
+	i := 0
+	for i < len(o.stash) {
+		b := &o.stash[i]
+		placed := false
+
+		// Try deepest level first (leaf = path[0], root = path[len-1])
+		for level := 0; level < len(path); level++ {
+			bucketIdx := path[level]
+			if !o.canPlaceAt(b.leaf, bucketIdx) {
+				continue
+			}
+			// Find empty slot in this bucket
+			for slot := range o.tree[bucketIdx] {
+				if o.tree[bucketIdx][slot].id == EmptyBlockID {
+					o.tree[bucketIdx][slot] = *b
+					// Remove from stash (swap with last, shrink)
+					o.stash[i] = o.stash[len(o.stash)-1]
+					o.stash = o.stash[:len(o.stash)-1]
+					placed = true
+					break
+				}
+			}
+			if placed {
+				break
+			}
+		}
+		if !placed {
+			i++
+		}
+	}
+
+	if len(o.stash) > o.cfg.StashLimit {
+		return ErrStashOverflow
+	}
+	return nil
 }
