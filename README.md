@@ -7,6 +7,7 @@ Path ORAM implementation in Go with pluggable storage, encryption, and position 
 - **Pluggable backends** — Storage, Encryptor, and PositionMap interfaces for custom implementations
 - **AES-256-GCM encryption** — Built-in authenticated encryption with random nonces
 - **Multiple eviction strategies** — LevelByLevel, GreedyByDepth, DeterministicTwoPath
+- **Batch writes** — `WriteBatch()` for bulk loading with deduplicated I/O and multi-path eviction
 - **Constant-time mode** — For TEE deployments (SGX, TrustZone) to mitigate timing side-channels
 - **Zero external dependencies** — Only Go standard library
 
@@ -21,6 +22,7 @@ pathoram-go/
 ├── posmap.go       # PositionMap interface + InMemoryPositionMap
 ├── eviction.go     # Eviction strategies
 ├── constanttime.go # Constant-time operations for TEE
+├── batch.go        # WriteBatch() for bulk writes
 └── oram_test.go    # Tests and benchmarks
 ```
 
@@ -53,6 +55,13 @@ data, err = oram.Read(42)
 // Access: nil = read, non-nil = write
 data, err = oram.Access(42, nil)        // read
 prev, err = oram.Access(42, newData)    // write
+
+// Batch write (not access-pattern oblivious)
+items := []pathoram.BatchItem{
+    {BlockID: 0, Data: block0},
+    {BlockID: 1, Data: block1},
+}
+err = oram.WriteBatch(items)
 ```
 
 ### With encryption
@@ -107,6 +116,7 @@ type PositionMap interface {
 | `Read(blockID) ([]byte, error)` | Read block, returns data |
 | `Write(blockID, data) ([]byte, error)` | Write block, returns previous value |
 | `Access(blockID, newData) ([]byte, error)` | Read if newData=nil, else write |
+| `WriteBatch(items) error` | Bulk write with deduplicated I/O (not oblivious) |
 
 ## Config
 
