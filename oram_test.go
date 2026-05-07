@@ -976,6 +976,109 @@ func BenchmarkEvictionStrategy(b *testing.B) {
 	}
 }
 
+// Baseline benchmarks: map and flat-array lookups for comparison with ORAM.
+// These measure the cost of a trivial key-value store (no obliviousness)
+// against PathORAM at identical N and BlockSize, for reviewer item 2.
+
+func BenchmarkBaselineMap(b *testing.B) {
+	numBlocksValues := []int{64, 256, 1024, 4096, 16384}
+	blockSizes := []int{256, 1024, 4096}
+
+	for _, numBlocks := range numBlocksValues {
+		for _, blockSize := range blockSizes {
+			name := fmt.Sprintf("blocks=%d/blockSize=%d", numBlocks, blockSize)
+
+			// Build map
+			m := make(map[int][]byte, numBlocks)
+			for i := 0; i < numBlocks; i++ {
+				m[i] = make([]byte, blockSize)
+			}
+			data := make([]byte, blockSize)
+
+			b.Run(name+"/write", func(b *testing.B) {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					m[i%numBlocks] = data
+				}
+			})
+
+			b.Run(name+"/read", func(b *testing.B) {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_ = m[i%numBlocks]
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkBaselineArray(b *testing.B) {
+	numBlocksValues := []int{64, 256, 1024, 4096, 16384}
+	blockSizes := []int{256, 1024, 4096}
+
+	for _, numBlocks := range numBlocksValues {
+		for _, blockSize := range blockSizes {
+			name := fmt.Sprintf("blocks=%d/blockSize=%d", numBlocks, blockSize)
+
+			// Build flat array
+			arr := make([][]byte, numBlocks)
+			for i := 0; i < numBlocks; i++ {
+				arr[i] = make([]byte, blockSize)
+			}
+			data := make([]byte, blockSize)
+
+			b.Run(name+"/write", func(b *testing.B) {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					arr[i%numBlocks] = data
+				}
+			})
+
+			b.Run(name+"/read", func(b *testing.B) {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_ = arr[i%numBlocks]
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkLinearScan measures linear scan over a flat array — O(N) per access.
+// This is the worst-case naive baseline (scan all entries to find one).
+func BenchmarkLinearScan(b *testing.B) {
+	numBlocksValues := []int{64, 256, 1024, 4096, 16384}
+	blockSizes := []int{256, 1024, 4096}
+
+	for _, numBlocks := range numBlocksValues {
+		for _, blockSize := range blockSizes {
+			name := fmt.Sprintf("blocks=%d/blockSize=%d", numBlocks, blockSize)
+
+			type entry struct {
+				id   int
+				data []byte
+			}
+			arr := make([]entry, numBlocks)
+			for i := 0; i < numBlocks; i++ {
+				arr[i] = entry{id: i, data: make([]byte, blockSize)}
+			}
+
+			b.Run(name+"/read", func(b *testing.B) {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					target := i % numBlocks
+					for j := 0; j < len(arr); j++ {
+						if arr[j].id == target {
+							_ = arr[j].data
+							break
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 // Benchmark stash size under different strategies
 func BenchmarkStashSizeByStrategy(b *testing.B) {
 	strategies := []struct {
